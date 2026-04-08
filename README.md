@@ -1,6 +1,6 @@
 # Sitemap Extract - Advanced XML Sitemap Processor
 
-An advanced XML sitemap processor built for large-scale URL extraction, capable of bypassing most modern anti-bot protection systems. It supports plain XML and compressed XML files (.xml.gz), along with unlimited levels of nested/child sitemaps. It can fetch sitemaps directly from URLs, from a file containing multiple sitemap URLs, or from a local directory of XML files.
+An advanced XML sitemap processor built for large-scale URL extraction, capable of bypassing most modern anti-bot protection systems. It supports plain XML and compressed XML files (.xml.gz), along with unlimited levels of nested/child sitemaps. It can fetch sitemaps directly from URLs, from a file containing multiple sitemap URLs, or from a local directory of `.xml` and `.xml.gz` files.
 
 Also features a number of optional and advanced settings such as dynamic proxy and user agent rotation, CloudScraper integration, fingerprint randomization, auto stealth mode, and includes detailed logging and monitoring.
 
@@ -61,7 +61,7 @@ Also features a number of optional and advanced settings such as dynamic proxy a
 - **Multiple input methods:**
   - Single sitemap URL (`--url`)
   - Batch processing from file (`--file`)
-  - Directory scanning for local XML files (`--directory`)
+  - Directory scanning for local `.xml` and `.xml.gz` files (`--directory`)
 - **Configurable output directory** (`--save-dir`)
 - **Smart filename generation** from source URLs
 - **Organized output files** with metadata headers
@@ -81,9 +81,11 @@ Also features a number of optional and advanced settings such as dynamic proxy a
 
 ## Installation
 
+Supported Python: 3.9+
+
 ```bash
 # Clone the repository
-git clone https://github.com/daddiofaddio/sitemap-extract.git
+git clone https://github.com/phase3dev/sitemap-extract.git
 cd sitemap-extract
 
 # Install dependencies
@@ -160,7 +162,7 @@ python3 sitemap_extract.py [OPTIONS]
 # Input Options
 --url URL                    Direct URL of sitemap file
 --file FILE                  File containing list of sitemap URLs
---directory DIR              Directory containing XML/XML.GZ files
+--directory DIR              Directory containing .xml and .xml.gz files
 
 # Output Options
 --save-dir DIR               Directory to save all output files (default: current)
@@ -168,7 +170,7 @@ python3 sitemap_extract.py [OPTIONS]
 # Anti-Detection Options
 --proxy-file FILE            File containing proxy list (see format below)
 --user-agent-file FILE       File containing user agent list
---stealth                    Maximum evasion mode (5-12s delays, warns about threading)
+--stealth                    Maximum evasion mode (5-12s delays, forces --max-workers=1)
 --no-cloudscraper            Use standard requests instead of CloudScraper
 
 # Performance Options
@@ -217,9 +219,14 @@ https://www.example.com/sitemaps/sitemap.xml.gz
 
 ### Individual Sitemap Files
 
-- **Format:** `domain_com_path_filename.txt`
-- **Contains:** All page URLs from that specific sitemap
+- **Format:** `domain_com_path_<short-hash>.txt`
+- **Contains:** Deduplicated page URLs from that specific sitemap source only
 - **Metadata:** Source URL, generation timestamp, URL count
+- **Uniqueness:** The short hash is derived from the full source URL, so query-distinct child sitemap URLs do not overwrite each other
+
+### Merged URL File
+
+- **`all_extracted_urls.txt`:** Deduplicated union of all extracted page URLs from the run, with the same metadata header format as per-sitemap files
 
 ### Summary Files
 
@@ -261,7 +268,7 @@ When `--stealth` is enabled:
 
 - Minimum delay increased to 5+ seconds
 - Maximum delay increased to 12+ seconds
-- Warning displayed if using multiple workers
+- `--max-workers` is forced to `1`
 - All other anti-detection features activated
 
 ### Threading with Staggering
@@ -270,7 +277,7 @@ Multi-threading includes automatic staggering to avoid simultaneous requests:
 
 - 0.5-2 second delays between thread starts
 - Each thread maintains individual timing
-- Stealth mode can still use multiple workers (with warning)
+- Stealth mode disables multi-worker execution by forcing a single worker
 
 ### Error Handling
 
@@ -298,6 +305,14 @@ Multi-threading includes automatic staggering to avoid simultaneous requests:
 This script purposely employs an HTTP-based approach, providing an optimal balance between stealth and efficiency. It's been tested on sites with millions of URLs and successfully bypasses protection on most sitemap sources.
 
 However, sites with advanced protection mechanisms (JavaScript challenges, CAPTCHA systems, behavioral analysis) will still require full browser automation tools.
+
+## Testing
+
+```bash
+python -m unittest test_sitemap_extract.py
+```
+
+Covers interruptible sleep behavior, proxy/IP formatting, interrupt propagation, concurrent stats and failure tracking, and a threaded local sitemap run.
 
 ## Contributing
 
