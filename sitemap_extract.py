@@ -5,7 +5,8 @@ import logging
 import argparse
 import cloudscraper
 import random
-import glob
+import hashlib
+import re
 from datetime import datetime
 import sys
 from urllib.parse import urljoin, urlparse
@@ -14,6 +15,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import signal
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Logging will be configured dynamically in main()
@@ -50,6 +52,68 @@ BROWSER_HEADERS = [
     },
 ]
 
+FILENAME_HASH_LENGTH = 10
+SLEEP_CHUNK_SECONDS = 0.1
+
+
+def canonicalize_save_dir(save_dir):
+    """Resolve the output directory once to a canonical absolute path."""
+    return os.path.abspath(save_dir or ".")
+
+
+def is_remote_source(source):
+    """Return True when the source is an HTTP(S) URL."""
+    return urlparse(source).scheme in ("http", "https")
+
+
+def is_compressed_source(source):
+    """Return True when the source path ends with .xml.gz."""
+    parsed_source = urlparse(source)
+    if is_remote_source(source):
+        return parsed_source.path.lower().endswith(".xml.gz")
+    return source.lower().endswith(".xml.gz")
+
+
+def sanitize_filename_component(value):
+    """Convert arbitrary text into a readable filesystem-safe filename part."""
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", value)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    return sanitized
+
+
+def build_output_filename(source):
+    """Build a readable, collision-resistant filename from the full source."""
+    parsed_source = urlparse(source)
+
+    if is_remote_source(source):
+        readable_parts = [parsed_source.netloc.replace(".", "_")]
+        path_part = parsed_source.path.strip("/")
+        readable_parts.append(path_part.replace("/", "_") if path_part else "root")
+    else:
+        local_name = os.path.basename(os.path.abspath(source))
+        readable_parts = [local_name]
+
+    readable_base = sanitize_filename_component("_".join(readable_parts)) or "sitemap"
+    source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()[
+        :FILENAME_HASH_LENGTH
+    ]
+    return f"{readable_base}_{source_hash}.txt"
+
+
+def scan_sitemap_directory(directory):
+    """Return only explicit .xml and .xml.gz files from a directory."""
+    sitemap_files = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+
+            entry_name = entry.name.lower()
+            if entry_name.endswith(".xml") or entry_name.endswith(".xml.gz"):
+                sitemap_files.append(os.path.abspath(entry.path))
+
+    return sorted(sitemap_files)
+
 
 class HumanizedSitemapProcessor:
     def __init__(
@@ -70,7 +134,10 @@ class HumanizedSitemapProcessor:
         self.max_workers = max_workers
         self.processed_urls = set()
         self.interrupted = False
-        self.save_dir = save_dir if save_dir else "."
+        self.save_dir = canonicalize_save_dir(save_dir)
+        self.processed_urls_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.request_pacing_lock = threading.Lock()
 
         # Enhanced failure tracking
         self.failed_urls = (
@@ -96,8 +163,6 @@ class HumanizedSitemapProcessor:
             "start_time": time.time(),
         }
         self.last_request_time = 0
-        self.current_proxy = None
-        self.current_user_agent = None
 
     def load_proxies(self, proxy_file):
         """Load proxies from file"""
@@ -140,18 +205,18 @@ class HumanizedSitemapProcessor:
             self.print_status(f"Error loading user agents: {str(e)}")
             return []
 
-    def get_current_ip(self):
+    def get_current_ip(self, proxy=None):
         """Get current IP address for monitoring"""
         try:
-            if self.current_proxy:
-                proxy_str = str(self.current_proxy.get("http", "Unknown"))
+            if proxy:
+                proxy_str = str(proxy.get("http", "Unknown"))
                 if "@" in proxy_str:
                     return proxy_str.split("@")[1].split(":")[0]
                 else:
                     return proxy_str.replace("http://", "").split(":")[0]
             else:
                 return "Direct Connection"
-        except:
+        except Exception:
             return "Unknown"
 
     def print_status(self, message):
@@ -159,44 +224,95 @@ class HumanizedSitemapProcessor:
         print(f"[{timestamp}] {message}")
         sys.stdout.flush()
 
+    def interruptible_sleep(self, duration):
+        """Sleep in short chunks so interrupts are handled promptly."""
+        if duration <= 0:
+            if self.interrupted:
+                raise KeyboardInterrupt()
+            return
+
+        end_time = time.time() + duration
+        while time.time() < end_time:
+            if self.interrupted:
+                raise KeyboardInterrupt()
+
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+
+            time.sleep(min(SLEEP_CHUNK_SECONDS, remaining))
+
+        if self.interrupted:
+            raise KeyboardInterrupt()
+
+    def increment_stat(self, stat_name, amount=1):
+        """Increment a session statistic under lock."""
+        with self.state_lock:
+            self.session_stats[stat_name] += amount
+
+    def record_failed_url(self, url, error, status_code=None, attempts=1):
+        """Record a failed sitemap fetch/load under lock."""
+        with self.state_lock:
+            self.failed_urls[url] = {
+                "error": error,
+                "status_code": status_code,
+                "attempts": attempts,
+            }
+
+    def get_state_snapshot(self):
+        """Return consistent snapshots of shared mutable state."""
+        with self.state_lock:
+            return {
+                "session_stats": dict(self.session_stats),
+                "failed_urls": dict(self.failed_urls),
+            }
+
+    def try_mark_processed_url(self, url):
+        """Mark a sitemap source as processed once."""
+        with self.processed_urls_lock:
+            if url in self.processed_urls or self.interrupted:
+                return False
+            self.processed_urls.add(url)
+            return True
+
+    def is_processed_url(self, url):
+        """Check whether a sitemap source has already been processed."""
+        with self.processed_urls_lock:
+            return url in self.processed_urls
+
     def human_delay(self):
         """Add human-like delays between requests"""
         if self.interrupted:
             raise KeyboardInterrupt()
 
-        current_time = time.time()
-        time_since_last = current_time - self.last_request_time
+        with self.request_pacing_lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
 
-        delay = random.uniform(self.min_delay, self.max_delay)
+            delay = random.uniform(self.min_delay, self.max_delay)
 
-        # 15% chance of longer pause
-        if random.random() < 0.15:
-            delay += random.uniform(3.0, 8.0)
-            self.print_status("Taking a longer human-like break...")
+            # 15% chance of longer pause
+            if random.random() < 0.15:
+                delay += random.uniform(3.0, 8.0)
+                self.print_status("Taking a longer human-like break...")
 
-        if time_since_last < delay:
-            sleep_time = delay - time_since_last
-            self.print_status(f"Waiting {sleep_time:.2f} seconds...")
+            if time_since_last < delay:
+                sleep_time = delay - time_since_last
+                self.print_status(f"Waiting {sleep_time:.2f} seconds...")
+                self.interruptible_sleep(sleep_time)
 
-            # Sleep in small chunks to allow interruption
-            end_time = time.time() + sleep_time
-            while time.time() < end_time:
-                if self.interrupted:
-                    raise KeyboardInterrupt()
-                time.sleep(0.1)
-
-        self.last_request_time = time.time()
+            self.last_request_time = time.time()
 
     def create_enhanced_scraper(self):
         """Create sophisticated scraper with rotating proxies and user agents"""
         # Rotate proxy for each request
         if self.proxies:
-            self.current_proxy = random.choice(self.proxies)
+            current_proxy = random.choice(self.proxies)
         else:
-            self.current_proxy = None
+            current_proxy = None
 
         # Rotate user agent for each request
-        self.current_user_agent = random.choice(self.user_agents)
+        current_user_agent = random.choice(self.user_agents)
 
         if self.use_cloudscraper:
             scraper = cloudscraper.create_scraper(
@@ -219,7 +335,7 @@ class HumanizedSitemapProcessor:
 
         # Set headers and FORCE our user agent (override cloudscraper)
         headers = random.choice(BROWSER_HEADERS).copy()
-        headers["User-Agent"] = self.current_user_agent
+        headers["User-Agent"] = current_user_agent
 
         # Add some randomness
         if random.random() < 0.3:
@@ -234,7 +350,7 @@ class HumanizedSitemapProcessor:
                     "Sec-CH-UA": '"Not_A Brand";v="8", "Chromium";v="120"',
                     "Sec-CH-UA-Mobile": "?0",
                     "Sec-CH-UA-Platform": '"Windows"'
-                    if "Windows" in self.current_user_agent
+                    if "Windows" in current_user_agent
                     else '"macOS"',
                 }
             )
@@ -242,13 +358,13 @@ class HumanizedSitemapProcessor:
         scraper.headers.update(headers)
 
         # CRITICAL: Force our user agent again after all header updates
-        scraper.headers["User-Agent"] = self.current_user_agent
+        scraper.headers["User-Agent"] = current_user_agent
 
         # Set proxy
-        if self.current_proxy:
-            scraper.proxies.update(self.current_proxy)
+        if current_proxy:
+            scraper.proxies.update(current_proxy)
 
-        return scraper
+        return scraper, current_proxy, current_user_agent
 
     def fetch_with_retries(self, url, is_compressed=False):
         """Fetch URL with retries and anti-detection measures"""
@@ -256,13 +372,16 @@ class HumanizedSitemapProcessor:
             if self.interrupted:
                 raise KeyboardInterrupt()
 
+            current_proxy = None
             try:
                 self.human_delay()
-                scraper = self.create_enhanced_scraper()
+                scraper, current_proxy, current_user_agent = (
+                    self.create_enhanced_scraper()
+                )
 
                 # Enhanced monitoring output
-                current_ip = self.get_current_ip()
-                ua_display = self.current_user_agent
+                current_ip = self.get_current_ip(current_proxy)
+                ua_display = current_user_agent
                 if len(ua_display) > 60:
                     ua_display = ua_display[:60] + "..."
 
@@ -291,23 +410,17 @@ class HumanizedSitemapProcessor:
                         self.print_status(
                             f"Waiting {wait_time:.2f} seconds before retry..."
                         )
-
-                        # Sleep in chunks to allow interruption
-                        end_time = time.time() + wait_time
-                        while time.time() < end_time:
-                            if self.interrupted:
-                                raise KeyboardInterrupt()
-                            time.sleep(0.1)
-
-                        self.session_stats["retries"] += 1
+                        self.interruptible_sleep(wait_time)
+                        self.increment_stat("retries")
                         continue
                     else:
                         # Final attempt failed, record detailed failure
-                        self.failed_urls[url] = {
-                            "error": f"HTTP 403 Forbidden after {self.max_retries + 1} attempts",
-                            "status_code": 403,
-                            "attempts": self.max_retries + 1,
-                        }
+                        self.record_failed_url(
+                            url,
+                            f"HTTP 403 Forbidden after {self.max_retries + 1} attempts",
+                            status_code=403,
+                            attempts=self.max_retries + 1,
+                        )
 
                 elif response.status_code == 429:
                     self.print_status(
@@ -318,23 +431,17 @@ class HumanizedSitemapProcessor:
                         self.print_status(
                             f"Rate limit hit, waiting {wait_time:.2f} seconds..."
                         )
-
-                        # Sleep in chunks to allow interruption
-                        end_time = time.time() + wait_time
-                        while time.time() < end_time:
-                            if self.interrupted:
-                                raise KeyboardInterrupt()
-                            time.sleep(0.1)
-
-                        self.session_stats["retries"] += 1
+                        self.interruptible_sleep(wait_time)
+                        self.increment_stat("retries")
                         continue
                     else:
                         # Final attempt failed, record detailed failure
-                        self.failed_urls[url] = {
-                            "error": f"HTTP 429 Rate Limited after {self.max_retries + 1} attempts",
-                            "status_code": 429,
-                            "attempts": self.max_retries + 1,
-                        }
+                        self.record_failed_url(
+                            url,
+                            f"HTTP 429 Rate Limited after {self.max_retries + 1} attempts",
+                            status_code=429,
+                            attempts=self.max_retries + 1,
+                        )
 
                 else:
                     self.print_status(
@@ -342,28 +449,29 @@ class HumanizedSitemapProcessor:
                     )
                     if attempt < self.max_retries:
                         wait_time = random.uniform(3, 8)
-                        time.sleep(wait_time)
-                        self.session_stats["retries"] += 1
+                        self.interruptible_sleep(wait_time)
+                        self.increment_stat("retries")
                         continue
                     else:
                         # Final attempt failed, record detailed failure
-                        self.failed_urls[url] = {
-                            "error": f"HTTP {response.status_code} after {self.max_retries + 1} attempts",
-                            "status_code": response.status_code,
-                            "attempts": self.max_retries + 1,
-                        }
+                        self.record_failed_url(
+                            url,
+                            f"HTTP {response.status_code} after {self.max_retries + 1} attempts",
+                            status_code=response.status_code,
+                            attempts=self.max_retries + 1,
+                        )
 
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                current_ip = self.get_current_ip()
+                current_ip = self.get_current_ip(current_proxy)
                 error_msg = str(e)
                 self.print_status(
                     f"Error with {current_ip}: {error_msg} - attempt {attempt + 1}/{self.max_retries + 1}"
                 )
                 if attempt < self.max_retries:
-                    time.sleep(random.uniform(5, 10))
-                    self.session_stats["retries"] += 1
+                    self.interruptible_sleep(random.uniform(5, 10))
+                    self.increment_stat("retries")
                     continue
                 else:
                     # Final attempt failed, record detailed failure
@@ -376,106 +484,148 @@ class HumanizedSitemapProcessor:
                             f"{error_msg} after {self.max_retries + 1} attempts"
                         )
 
-                    self.failed_urls[url] = {
-                        "error": error_description,
-                        "status_code": None,
-                        "attempts": self.max_retries + 1,
-                    }
+                    self.record_failed_url(
+                        url,
+                        error_description,
+                        status_code=None,
+                        attempts=self.max_retries + 1,
+                    )
 
         logging.error(f"Failed to fetch {url} after {self.max_retries + 1} attempts")
-        self.session_stats["errors"] += 1
+        self.increment_stat("errors")
         return None
+
+    def load_local_sitemap(self, path, is_compressed=False):
+        """Load and parse a local sitemap file."""
+        try:
+            open_file = gzip.open if is_compressed else open
+            with open_file(path, "rb") as handle:
+                return ET.fromstring(handle.read())
+        except Exception as e:
+            error_msg = str(e)
+            self.record_failed_url(path, error_msg, status_code=None, attempts=1)
+            self.increment_stat("errors")
+            logging.error(f"Failed to load local sitemap {path}: {error_msg}")
+            self.print_status(f"Failed to load local sitemap {path}: {error_msg}")
+            return None
+
+    def load_sitemap_root(self, source):
+        """Load a sitemap root from either a remote URL or a local file."""
+        is_compressed = is_compressed_source(source)
+        if is_remote_source(source):
+            return self.fetch_with_retries(source, is_compressed)
+        return self.load_local_sitemap(source, is_compressed)
+
+    def resolve_child_sitemap_source(self, parent_source, child_source):
+        """Resolve nested sitemap references for remote URLs and local files."""
+        child_source = child_source.strip()
+        if not child_source:
+            return None
+
+        if is_remote_source(parent_source):
+            return urljoin(parent_source, child_source)
+
+        if is_remote_source(child_source):
+            return child_source
+
+        if os.path.isabs(child_source):
+            return os.path.abspath(child_source)
+
+        return os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(parent_source)), child_source)
+        )
+
+    def write_url_file(self, filepath, source_label, urls):
+        """Write a sorted, deduplicated URL list with the standard metadata header."""
+        unique_urls = sorted(set(urls))
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(f"Source URL: {source_label}\n")
+            f.write(f"Generated: {datetime.now().isoformat()}\n")
+            f.write(f"Total URLs: {len(unique_urls)}\n")
+            f.write("-" * 50 + "\n")
+            for url in unique_urls:
+                f.write(f"{url}\n")
+
+        return unique_urls
 
     def save_urls(self, source_url, urls):
         """Save URLs to file"""
-        if not urls and source_url != "all_sitemaps_summary":
+        if not urls:
             return
 
         try:
-            if source_url == "all_sitemaps_summary":
-                # Special handling for sitemap summary with failure annotations
-                filename = os.path.join(self.save_dir, "all_sitemaps_summary.log")
-                successful_urls = sorted(urls) if urls else []
-                total_urls = len(successful_urls) + len(self.failed_urls)
-
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write(f"Source URL: all_sitemaps_summary\n")
-                    f.write(f"Generated: {datetime.now().isoformat()}\n")
-                    f.write(f"Total URLs: {total_urls}\n")
-                    f.write(f"Successful URLs: {len(successful_urls)}\n")
-                    f.write(f"Failed URLs: {len(self.failed_urls)}\n")
-                    f.write("-" * 50 + "\n")
-
-                    # Write successful URLs
-                    for url in successful_urls:
-                        f.write(f"{url}\n")
-
-                    # Write failed URLs with detailed annotations
-                    for failed_url, failure_info in sorted(self.failed_urls.items()):
-                        error_detail = failure_info.get("error", "Unknown error")
-                        f.write(f"{failed_url} [*{error_detail}*]\n")
-
-                self.print_status(
-                    f"Saved sitemap summary: {len(successful_urls)} successful, {len(self.failed_urls)} failed URLs to {filename}"
-                )
-
-                # Also create the clean failed URLs file for easy reprocessing
-                if self.failed_urls:
-                    failed_filename = os.path.join(
-                        self.save_dir, "failed_sitemap_urls.txt"
-                    )
-                    with open(failed_filename, "w", encoding="utf-8") as f:
-                        f.write(f"# Failed sitemap URLs for reprocessing\n")
-                        f.write(f"# Generated: {datetime.now().isoformat()}\n")
-                        f.write(f"# Total failed URLs: {len(self.failed_urls)}\n")
-                        f.write(
-                            f"# Usage: python sitemap_extract.py --file {failed_filename}\n"
-                        )
-                        f.write("-" * 50 + "\n")
-                        for failed_url in sorted(self.failed_urls.keys()):
-                            f.write(f"{failed_url}\n")
-                    self.print_status(
-                        f"Saved {len(self.failed_urls)} failed URLs to {failed_filename} for reprocessing"
-                    )
-
-            else:
-                # Normal URL file handling
-                parsed_url = urlparse(source_url)
-                filename = (
-                    parsed_url.netloc.replace(".", "_")
-                    + "_"
-                    + parsed_url.path.replace("/", "_").strip("_")
-                )
-                filename = "".join(
-                    c for c in filename if c.isalnum() or c in ("_", "-")
-                )
-                filename = f"{filename}.txt" if filename else "sitemap_urls.txt"
-                filepath = os.path.join(self.save_dir, filename)
-
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(f"Source URL: {source_url}\n")
-                    f.write(f"Generated: {datetime.now().isoformat()}\n")
-                    f.write(f"Total URLs: {len(urls)}\n")
-                    f.write("-" * 50 + "\n")
-                    for url in sorted(urls):
-                        f.write(f"{url}\n")
-
-                self.print_status(f"Saved {len(urls)} URLs to {filepath}")
+            filepath = os.path.join(self.save_dir, build_output_filename(source_url))
+            unique_urls = self.write_url_file(filepath, source_url, urls)
+            self.print_status(f"Saved {len(unique_urls)} URLs to {filepath}")
 
         except Exception as e:
             self.print_status(f"Failed to save URLs: {str(e)}")
 
+    def save_all_extracted_urls(self, urls):
+        """Always write the merged extracted URL output file."""
+        filepath = os.path.join(self.save_dir, "all_extracted_urls.txt")
+        source_label = "all_extracted_urls (merged from all processed sitemaps)"
+
+        try:
+            unique_urls = self.write_url_file(filepath, source_label, urls)
+            self.print_status(f"Saved {len(unique_urls)} merged URLs to {filepath}")
+        except Exception as e:
+            self.print_status(f"Failed to save merged URLs: {str(e)}")
+
+    def save_sitemap_summary(self, sitemap_urls):
+        """Save the sitemap summary log and the failed sitemap URL list."""
+        failed_urls = self.get_state_snapshot()["failed_urls"]
+        filename = os.path.join(self.save_dir, "all_sitemaps_summary.log")
+        all_known_urls = sorted(set(sitemap_urls) | set(failed_urls.keys()))
+        successful_urls = [url for url in all_known_urls if url not in failed_urls]
+
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("Source URL: all_sitemaps_summary\n")
+                f.write(f"Generated: {datetime.now().isoformat()}\n")
+                f.write(f"Total URLs: {len(all_known_urls)}\n")
+                f.write(f"Successful URLs: {len(successful_urls)}\n")
+                f.write(f"Failed URLs: {len(failed_urls)}\n")
+                f.write("-" * 50 + "\n")
+
+                for url in successful_urls:
+                    f.write(f"{url}\n")
+
+                for failed_url, failure_info in sorted(failed_urls.items()):
+                    error_detail = failure_info.get("error", "Unknown error")
+                    f.write(f"{failed_url} [*{error_detail}*]\n")
+
+            self.print_status(
+                f"Saved sitemap summary: {len(successful_urls)} successful, {len(failed_urls)} failed URLs to {filename}"
+            )
+
+            if failed_urls:
+                failed_filename = os.path.join(self.save_dir, "failed_sitemap_urls.txt")
+                with open(failed_filename, "w", encoding="utf-8") as f:
+                    f.write("# Failed sitemap URLs for reprocessing\n")
+                    f.write(f"# Generated: {datetime.now().isoformat()}\n")
+                    f.write(f"# Total failed URLs: {len(failed_urls)}\n")
+                    f.write(
+                        f"# Usage: python sitemap_extract.py --file {failed_filename}\n"
+                    )
+                    f.write("-" * 50 + "\n")
+                    for failed_url in sorted(failed_urls.keys()):
+                        f.write(f"{failed_url}\n")
+                self.print_status(
+                    f"Saved {len(failed_urls)} failed URLs to {failed_filename} for reprocessing"
+                )
+        except Exception as e:
+            self.print_status(f"Failed to save sitemap summary: {str(e)}")
+
     def process_sitemap(self, url):
         """Process single sitemap"""
-        if url in self.processed_urls or self.interrupted:
+        if not self.try_mark_processed_url(url):
             return [], []
 
-        self.processed_urls.add(url)
+        root = self.load_sitemap_root(url)
 
-        is_compressed = url.endswith(".xml.gz")
-        root = self.fetch_with_retries(url, is_compressed)
-
-        if not root:
+        if root is None:
             return [], []
 
         sitemap_urls = []
@@ -485,8 +635,8 @@ class HumanizedSitemapProcessor:
         for sitemap in root.findall(".//sm:sitemap", namespace):
             loc_element = sitemap.find("sm:loc", namespace)
             if loc_element is not None and loc_element.text:
-                sitemap_url = urljoin(url, loc_element.text.strip())
-                if sitemap_url not in self.processed_urls:
+                sitemap_url = self.resolve_child_sitemap_source(url, loc_element.text)
+                if sitemap_url and not self.is_processed_url(sitemap_url):
                     sitemap_urls.append(sitemap_url)
 
         for page in root.findall(".//sm:url", namespace):
@@ -494,8 +644,8 @@ class HumanizedSitemapProcessor:
             if loc_element is not None and loc_element.text:
                 page_urls.append(loc_element.text.strip())
 
-        self.session_stats["sitemaps_processed"] += 1
-        self.session_stats["pages_found"] += len(page_urls)
+        self.increment_stat("sitemaps_processed")
+        self.increment_stat("pages_found", len(page_urls))
 
         self.print_status(
             f"Processed: {len(sitemap_urls)} nested sitemaps, {len(page_urls)} pages"
@@ -509,7 +659,7 @@ class HumanizedSitemapProcessor:
     def process_sitemap_delayed(self, url, initial_delay):
         """Process sitemap with initial stagger delay"""
         if initial_delay > 0:
-            time.sleep(initial_delay)
+            self.interruptible_sleep(initial_delay)
         return self.process_sitemap(url)
 
     def signal_handler(self, signum, frame):
@@ -522,9 +672,9 @@ class HumanizedSitemapProcessor:
         # Set up signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
 
-        all_sitemap_urls = set()
+        queue = list(dict.fromkeys(start_urls))
+        all_sitemap_urls = set(queue)
         all_page_urls = set()
-        queue = list(set(start_urls))
 
         self.print_status(f"Starting processing of {len(queue)} initial sitemaps")
         self.print_status(
@@ -547,11 +697,11 @@ class HumanizedSitemapProcessor:
                             surl
                             for surl in sitemap_urls
                             if surl not in all_sitemap_urls
-                            and surl not in self.processed_urls
+                            and not self.is_processed_url(surl)
                         ]
                         queue.extend(new_sitemaps)
 
-                        all_sitemap_urls.update(sitemap_urls)
+                        all_sitemap_urls.update(new_sitemaps)
                         all_page_urls.update(page_urls)
 
                         self.print_status(
@@ -563,7 +713,7 @@ class HumanizedSitemapProcessor:
                     except Exception as e:
                         logging.error(f"Error processing {url}: {str(e)}")
                         self.print_status(f"Error processing {url}: {str(e)}")
-                        self.session_stats["errors"] += 1
+                        self.increment_stat("errors")
             else:
                 # Multi-threaded processing
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -596,17 +746,17 @@ class HumanizedSitemapProcessor:
                                     surl
                                     for surl in sitemap_urls
                                     if surl not in all_sitemap_urls
-                                    and surl not in self.processed_urls
+                                    and not self.is_processed_url(surl)
                                 ]
                                 queue.extend(new_sitemaps)
 
-                                all_sitemap_urls.update(sitemap_urls)
+                                all_sitemap_urls.update(new_sitemaps)
                                 all_page_urls.update(page_urls)
 
                             except Exception as e:
                                 logging.error(f"Error processing {url}: {str(e)}")
                                 self.print_status(f"Error processing {url}: {str(e)}")
-                                self.session_stats["errors"] += 1
+                                self.increment_stat("errors")
 
                         self.print_status(
                             f"Queue size: {len(queue)}, Total URLs found: {len(all_page_urls)}"
@@ -615,31 +765,35 @@ class HumanizedSitemapProcessor:
         except KeyboardInterrupt:
             self.print_status("Processing interrupted by user")
 
-        if all_sitemap_urls:
-            self.save_urls("all_sitemaps_summary", sorted(all_sitemap_urls))
+        self.save_all_extracted_urls(all_page_urls)
+        self.save_sitemap_summary(all_sitemap_urls)
 
         return all_sitemap_urls, all_page_urls
 
     def print_summary(self, all_sitemap_urls, all_page_urls):
         """Print summary"""
-        elapsed_time = time.time() - self.session_stats["start_time"]
-        successful_sitemaps = len(all_sitemap_urls) - len(self.failed_urls)
+        state_snapshot = self.get_state_snapshot()
+        session_stats = state_snapshot["session_stats"]
+        failed_urls = state_snapshot["failed_urls"]
+        elapsed_time = time.time() - session_stats["start_time"]
+        total_sitemaps = len(set(all_sitemap_urls) | set(failed_urls.keys()))
+        successful_sitemaps = max(total_sitemaps - len(failed_urls), 0)
 
         self.print_status("=" * 60)
         self.print_status("PROCESSING COMPLETE")
         self.print_status("=" * 60)
         self.print_status(f"Total runtime: {elapsed_time:.2f} seconds")
-        self.print_status(f"Unique sitemap URLs found: {len(all_sitemap_urls)}")
+        self.print_status(f"Unique sitemap URLs found: {total_sitemaps}")
         self.print_status(f"Sitemap URLs successfully processed: {successful_sitemaps}")
         self.print_status(f"Total page URLs extracted: {len(all_page_urls)}")
-        if self.failed_urls:
+        if failed_urls:
             self.print_status(
-                f'Sitemap URLs failed to process: {len(self.failed_urls)} [specific URLs listed in "failed_sitemap_urls.txt"]'
+                f'Sitemap URLs failed to process: {len(failed_urls)} [specific URLs listed in "failed_sitemap_urls.txt"]'
             )
         else:
             self.print_status(f"Sitemap URLs failed to process: 0")
-        self.print_status(f"Errors encountered: {self.session_stats['errors']}")
-        self.print_status(f"Retries performed: {self.session_stats['retries']}")
+        self.print_status(f"Errors encountered: {session_stats['errors']}")
+        self.print_status(f"Retries performed: {session_stats['retries']}")
 
 
 def main():
@@ -648,7 +802,9 @@ def main():
     )
     parser.add_argument("--url", type=str, help="Direct URL of sitemap file")
     parser.add_argument("--file", type=str, help="File containing list of sitemap URLs")
-    parser.add_argument("--directory", type=str, help="Directory containing XML files")
+    parser.add_argument(
+        "--directory", type=str, help="Directory containing .xml and .xml.gz files"
+    )
     parser.add_argument(
         "--save-dir",
         type=str,
@@ -681,20 +837,23 @@ def main():
     parser.add_argument(
         "--stealth",
         action="store_true",
-        help="Extra stealth mode (forces max-workers=1)",
+        help="Extra stealth mode (raises delays and forces --max-workers=1)",
     )
 
     args = parser.parse_args()
 
+    if args.max_workers < 1:
+        parser.error("--max-workers must be at least 1")
+
+    save_dir = canonicalize_save_dir(args.save_dir)
+
     # Create save directory if specified and doesn't exist
-    save_dir = args.save_dir if args.save_dir else "."
-    if args.save_dir:
-        try:
-            os.makedirs(args.save_dir, exist_ok=True)
-            print(f"[INFO] Using save directory: {os.path.abspath(args.save_dir)}")
-        except Exception as e:
-            print(f"[ERROR] Could not create save directory {args.save_dir}: {str(e)}")
-            return 1
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"[INFO] Using save directory: {save_dir}")
+    except Exception as e:
+        print(f"[ERROR] Could not create save directory {save_dir}: {str(e)}")
+        return 1
 
     # Configure logging to use save directory
     log_filepath = os.path.join(save_dir, "sitemap_processing.log")
@@ -707,20 +866,9 @@ def main():
 
     # Stealth adjustments
     if args.stealth:
-        if args.min_delay < 5.0:
-            print(
-                f"[WARNING] Stealth mode overriding min-delay from {args.min_delay} to 5.0 seconds"
-            )
-        if args.max_delay < 12.0:
-            print(
-                f"[WARNING] Stealth mode overriding max-delay from {args.max_delay} to 12.0 seconds"
-            )
         args.min_delay = max(args.min_delay, 5.0)
         args.max_delay = max(args.max_delay, 12.0)
-        if args.max_workers > 1:
-            print(
-                f"[WARNING] Using {args.max_workers} workers in stealth mode may reduce stealth effectiveness"
-            )
+        args.max_workers = 1
 
     # Collect URLs to process
     urls_to_process = []
@@ -734,7 +882,11 @@ def main():
             print(f"[ERROR] Could not read file {args.file}: {str(e)}")
             return 1
     if args.directory:
-        urls_to_process.extend(glob.glob(os.path.join(args.directory, "*.xml*")))
+        try:
+            urls_to_process.extend(scan_sitemap_directory(args.directory))
+        except Exception as e:
+            print(f"[ERROR] Could not read directory {args.directory}: {str(e)}")
+            return 1
 
     if not urls_to_process:
         print("[ERROR] No URLs provided")
@@ -749,7 +901,7 @@ def main():
         max_delay=args.max_delay,
         max_retries=args.max_retries,
         max_workers=args.max_workers,
-        save_dir=args.save_dir,
+        save_dir=save_dir,
     )
 
     try:
