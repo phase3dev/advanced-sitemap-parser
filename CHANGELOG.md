@@ -25,7 +25,7 @@ All notable changes to this project will be documented in this file.
 - Fixed directory scanning for `--directory` inputs so only `.xml` and `.xml.gz` files are matched.
 - Fixed save directory handling so the processor always receives one canonical resolved output path.
 - Fixed local sitemap loading and nested local sitemap resolution for directory-based processing.
-- Fixed the README clone URL to `phase3dev/sitemap-extract`.
+- Fixed the README clone URL to the canonical Phase3Dev repository URL.
 - Fixed the retry path for non-403/non-429 HTTP status codes so sleep delays remain promptly interruptible.
 - Fixed the generic retry sleep path so Ctrl+C is handled promptly during backoff waits.
 - Fixed `get_current_ip()` to avoid a bare `except` that could swallow `KeyboardInterrupt` or `SystemExit`.
