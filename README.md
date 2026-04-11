@@ -1,4 +1,4 @@
-# Sitemap Extract - Advanced XML Sitemap Processor
+# Advanced Sitemap Parser
 
 An advanced XML sitemap processor built for large-scale URL extraction, capable of bypassing most modern anti-bot protection systems. It supports plain XML and compressed XML files (.xml.gz), along with unlimited levels of nested/child sitemaps. It can fetch sitemaps directly from URLs, from a file containing multiple sitemap URLs, or from a local directory of `.xml` and `.xml.gz` files.
 
@@ -85,12 +85,26 @@ Supported Python: 3.9+
 
 ```bash
 # Clone the repository
-git clone https://github.com/phase3dev/sitemap-extract.git
-cd sitemap-extract
+git clone https://github.com/phase3dev/advanced-sitemap-parser.git
+cd advanced-sitemap-parser
 
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+## CloudScraper Notice
+
+CloudScraper has an upstream memory leak issue tracked in [VeNoMouS/cloudscraper issue #328](https://github.com/VeNoMouS/cloudscraper/issues/328). In CloudScraper `3.0.0`, `rotate_tls_ciphers=True` can leak memory by mounting a new TLS adapter on every request without closing the old one.
+
+This project uses `cloudscraper.create_scraper(...)`, so long-running or high-volume CloudScraper runs may be affected depending on the installed CloudScraper version and behavior. This is an upstream CloudScraper issue, not a bug in `advanced-sitemap-parser`.
+
+Current workaround from the issue:
+
+```python
+scraper = cloudscraper.create_scraper(rotate_tls_ciphers=False)
+```
+
+If you observe growing memory usage during long CloudScraper runs, test with `rotate_tls_ciphers=False` and rotate sessions externally if needed. If upstream fixes the issue in a later release, this note can be revisited.
 
 ## Quick Start
 
