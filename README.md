@@ -1,4 +1,9 @@
-# Advanced Sitemap Parser
+<div align="center">
+  <img src="./repo_assets/sp-icon.png" srcset="./repo_assets/sp-icon@2x.png 2x" alt="Advanced Sitemap Parser icon"
+    width="128" />
+  <br />
+  <h1>Advanced Sitemap Parser</h1>
+</div>
 
 An advanced XML sitemap parser designed for large-scale URL extraction, capable of processing millions of URLs while bypassing most modern anti-bot protections. It supports both plain XML and compressed XML files (.xml.gz), as well as unlimited levels of nested child sitemaps. Sitemaps can be loaded directly from URLs, from a file containing multiple sitemap URLs, or from a local directory of `.xml` and `.xml.gz` files.
 
